@@ -114,13 +114,14 @@ class YouTubeLyricsProvider(MetadataProvider):
                     video_id = pm.item_id
                     break
 
+        artist_name = track.artists[0].name if track.artists else None
+
         # If not found, check if searching is enabled
         enable_search = self.config.get_value(CONF_ENABLE_SEARCH, False)
         if not video_id and enable_search:
             if not track.artists or not track.name:
                 self.logger.debug("Skipping search lookup: missing artist or track name.")
                 return None
-            artist_name = track.artists[0].name
             query = f"{track.name} {artist_name}"
             video_id = await self._search_youtube_video_id(query)
 
@@ -129,7 +130,7 @@ class YouTubeLyricsProvider(MetadataProvider):
             return None
 
         # Fetch transcript
-        lrc_content = await self._fetch_transcript_as_lrc(video_id)
+        lrc_content = await self._fetch_transcript_as_lrc(video_id, track.name, artist_name)
         if lrc_content:
             metadata = MediaItemMetadata()
             metadata.lrc_lyrics = lrc_content
@@ -152,8 +153,10 @@ class YouTubeLyricsProvider(MetadataProvider):
 
         return await asyncio.to_thread(_search)
 
-    async def _fetch_transcript_as_lrc(self, video_id: str) -> str | None:
-        """Retrieve and format transcript as LRC from a YouTube Video ID."""
+    async def _fetch_transcript_as_lrc(
+        self, video_id: str, track_name: str | None = None, artist_name: str | None = None
+    ) -> str | None:
+        """Retrieve and format transcript as LRC from a YouTube Video ID, with fallback search."""
         # Get configuration settings
         languages_str = self.config.get_value(CONF_LANGUAGES, "en")
         languages = [lang.strip() for lang in languages_str.split(",") if lang.strip()]
@@ -163,33 +166,55 @@ class YouTubeLyricsProvider(MetadataProvider):
         def _fetch():
             try:
                 ytt_api = YouTubeTranscriptApi()
-                transcript_list = ytt_api.list(video_id)
 
-                # Filter transcripts based on configuration
+                def _get_from_id(v_id):
+                    transcript_list = ytt_api.list(v_id)
+                    transcript_obj = None
+                    try:
+                        transcript_obj = transcript_list.find_manually_created_transcript(languages)
+                    except Exception:
+                        pass
+                    if not transcript_obj and allow_generated:
+                        try:
+                            transcript_obj = transcript_list.find_generated_transcript(languages)
+                        except Exception:
+                            pass
+                    if not transcript_obj:
+                        try:
+                            transcript_obj = transcript_list.find_transcript(languages)
+                        except Exception:
+                            pass
+                    return transcript_obj
+
+                # Try primary video ID
                 transcript_obj = None
-                
-                # First try to find manual transcripts in preferred languages
                 try:
-                    transcript_obj = transcript_list.find_manually_created_transcript(languages)
-                except Exception:
-                    pass
+                    transcript_obj = _get_from_id(video_id)
+                except Exception as e:
+                    self.logger.debug("Failed to get transcript for primary Video ID %s: %s", video_id, e)
 
-                # If not found and auto-generated is allowed, look for auto-generated in preferred languages
-                if not transcript_obj and allow_generated:
+                # Fallback search if primary video ID failed to return a transcript
+                if not transcript_obj and track_name and artist_name:
+                    query = f"{track_name} {artist_name}"
+                    self.logger.info("Primary video has no transcript. Attempting fallback search for: %s", query)
                     try:
-                        transcript_obj = transcript_list.find_generated_transcript(languages)
-                    except Exception:
-                        pass
+                        results = self._get_ytm().search(query=query, filter="songs", limit=5)
+                        for item in results:
+                            alt_id = item.get("videoId")
+                            if alt_id and alt_id != video_id:
+                                self.logger.debug("Trying fallback alternative video ID: %s (%s)", alt_id, item.get("title"))
+                                try:
+                                    transcript_obj = _get_from_id(alt_id)
+                                    if transcript_obj:
+                                        self.logger.info("Found transcript using alternative fallback Video ID: %s", alt_id)
+                                        break
+                                except Exception as alt_err:
+                                    self.logger.debug("Fallback alternative video ID %s failed: %s", alt_id, alt_err)
+                    except Exception as search_err:
+                        self.logger.warning("Fallback search failed: %s", search_err)
 
-                # Fallback to finding any transcript in preferred languages if strict check wasn't enough
                 if not transcript_obj:
-                    try:
-                        transcript_obj = transcript_list.find_transcript(languages)
-                    except Exception:
-                        pass
-
-                if not transcript_obj:
-                    self.logger.debug("No matching transcript found for Video ID %s", video_id)
+                    self.logger.debug("No transcript found for Video ID %s (or fallbacks)", video_id)
                     return None
 
                 # Handle translation if configured
@@ -200,9 +225,9 @@ class YouTubeLyricsProvider(MetadataProvider):
                             self.logger.debug("Translating transcript to %s", translate_to)
                             transcript_obj = transcript_obj.translate(translate_to)
                         else:
-                            self.logger.warning("Translation to %s not available for Video ID %s", translate_to, video_id)
+                            self.logger.warning("Translation to %s not available", translate_to)
                     else:
-                        self.logger.warning("Transcript for Video ID %s is not translatable", video_id)
+                        self.logger.warning("Transcript is not translatable")
 
                 # Retrieve the raw chunks
                 transcript_data = transcript_obj.fetch()
@@ -218,7 +243,7 @@ class YouTubeLyricsProvider(MetadataProvider):
                 return "\n".join(lrc_lines)
 
             except Exception as e:
-                self.logger.warning("Failed to fetch transcript for Video ID %s: %s", video_id, e)
+                self.logger.warning("Failed to fetch transcript: %s", e)
                 return None
 
         return await asyncio.to_thread(_fetch)
