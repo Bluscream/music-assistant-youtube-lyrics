@@ -1,0 +1,15 @@
+{
+  "type": "metadata",
+  "domain": "youtube_lyrics",
+  "stage": "stable",
+  "name": "YouTube Lyrics",
+  "description": "Fetches track transcripts/lyrics from YouTube and YouTube Music.",
+  "codeowners": ["@bluscream"],
+  "requirements": [
+    "youtube-transcript-api==1.2.4",
+    "ytmusicapi==1.12.1"
+  ],
+  "multi_instance": false,
+  "allow_disable": true,
+  "icon": "mdi-youtube"
+}
